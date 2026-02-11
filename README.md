@@ -8,10 +8,6 @@ A Prometheus exporter for monitoring THORChain validator nodes. This exporter sc
 - **Chain Heights**: Track observed chain heights per validator and global reference heights
 - **Bond Providers**: Monitor bond provider counts and distribution
 - **Preflight Status**: Track validator preflight readiness
-- **Health Monitoring**: Built-in exporter health metrics with uptime and scrape duration
-- **Flexible Logging**: Support for JSON or key-value formatted logs with configurable log levels
-- **Graceful Shutdown**: Proper signal handling for clean shutdowns
-- **Stale Metric Cleanup**: Automatic removal of metrics for chains that are no longer observed
 
 ## Requirements
 
@@ -123,9 +119,9 @@ python3 exporter.py \
 Contributions are welcome! Please:
 
 1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
+2. Create a feature branch
+3. Commit your changes
+4. Push to the branch
 5. Open a Pull Request
 
 ## License
