@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  thorchain-exporter:
+    build: .
+    ports:
+      - "9809:9809"
+    environment:
+      # Optional: Set environment variables if needed
+      - LOG_LEVEL=INFO
+    command:
+      - --thornode-url=https://thornode.ninerealms.com
+      - --node-address=YOUR_NODE_ADDRESS_HERE
+      - --listen=0.0.0.0
+      - --port=9809
+      - --interval=15.0
+      - --timeout=10.0
+      - --json-logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9809/metrics"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
