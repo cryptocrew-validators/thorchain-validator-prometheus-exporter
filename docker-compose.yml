@@ -23,3 +23,17 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    depends_on:
+      thorchain-exporter:
+        condition: service_healthy
+    restart: unless-stopped
