@@ -3,8 +3,8 @@
 THORChain Prometheus exporter: node metadata + slash points + observe heights + global reference heights.
 
 Scrapes:
-  1) GET {THORNODE_URL}/thorchain/node/{NODE_ADDRESS}
-  2) GET {THORNODE_URL}/thorchain/lastblock
+  1) GET {THORNODE_URL}/thorchain/node/{NODE_ADDRESS}   (for each node)
+  2) GET {THORNODE_URL}/thorchain/lastblock            (once per cycle)
 
 Exports:
   thorchain_validator_info{node_address="...",status="Active",node_operator_address="...",ip_address="...",version="..."} 1
@@ -38,7 +38,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Set, Tuple, List
 
 from prometheus_client import Gauge, start_http_server
 
@@ -304,7 +304,6 @@ def _safe_str(v: Any) -> str:
     if v is None:
         return ""
     s = str(v)
-    # keep label values bounded
     return s if len(s) <= 256 else s[:256] + "…"
 
 
@@ -441,7 +440,7 @@ def scrape_node(thornode_url: str, node_address: str, timeout: float, insecure: 
     return payload
 
 
-def scrape_global_lastblock(thornode_url: str, node_address: str, timeout: float, insecure: bool) -> Dict[str, int]:
+def scrape_global_lastblock_once(thornode_url: str, timeout: float, insecure: bool) -> Tuple[Dict[str, int], float]:
     base = thornode_url.rstrip("/")
     url = f"{base}/thorchain/lastblock"
 
@@ -449,12 +448,11 @@ def scrape_global_lastblock(thornode_url: str, node_address: str, timeout: float
     t0 = time.time()
     payload = http_get_json(url, timeout=timeout, insecure=insecure)
     dt = time.time() - t0
-    METRIC_ENDPOINT_DURATION.labels(node_address, "lastblock").set(dt)
 
     global_heights = parse_global_lastblock(payload)
     LOG.debug("Lastblock parsed", extra={"url": url, "duration_s": round(dt, 4), "global_chains": len(global_heights)})
     LOG.trace("Global heights sample", extra={"sample": dict(list(global_heights.items())[:6])})
-    return global_heights
+    return global_heights, dt
 
 
 # ---------------- Stale metric cleanup ----------------
@@ -475,12 +473,37 @@ def remove_stale_global_chain_metrics(previous: Set[str], current: Set[str]) -> 
             pass
 
 
+def parse_node_addresses(raw: str) -> List[str]:
+    out: List[str] = []
+    for part in raw.split(","):
+        a = part.strip()
+        if a:
+            out.append(a)
+    # de-dup but preserve order
+    seen: Set[str] = set()
+    deduped: List[str] = []
+    for a in out:
+        if a not in seen:
+            seen.add(a)
+            deduped.append(a)
+    return deduped
+
+
 # ---------------- Main loop ----------------
 
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--thornode-url", required=True)
-    p.add_argument("--node-address", required=True)
+
+    # Back-compat: old single-node flag
+    p.add_argument("--node-address", help="(deprecated) Single node address; prefer --node-addresses")
+
+    # New: multiple nodes
+    p.add_argument(
+        "--node-addresses",
+        help="Comma-separated list of node addresses to scrape (e.g. addr1,addr2,addr3). Overrides --node-address.",
+    )
+
     p.add_argument("--listen", default="0.0.0.0")
     p.add_argument("--port", type=int, default=9809)
     p.add_argument("--interval", type=float, default=15.0)
@@ -491,6 +514,16 @@ def main() -> None:
     args = p.parse_args()
 
     configure_logging(args.log_level, args.json_logs)
+
+    if args.node_addresses:
+        node_addresses = parse_node_addresses(args.node_addresses)
+    elif args.node_address:
+        node_addresses = [args.node_address.strip()]
+    else:
+        p.error("Must provide --node-addresses or --node-address")
+
+    if not node_addresses:
+        p.error("No node addresses provided after parsing")
 
     shutdown = GracefulShutdown()
     shutdown.install()
@@ -503,7 +536,7 @@ def main() -> None:
             "listen": args.listen,
             "port": args.port,
             "thornode_url": args.thornode_url,
-            "node_address": args.node_address,
+            "node_addresses": node_addresses,
             "interval_s": args.interval,
             "timeout_s": args.timeout,
             "insecure_tls": args.insecure,
@@ -512,135 +545,179 @@ def main() -> None:
         },
     )
 
-    # Ensure base series exist immediately
-    METRIC_UP.labels(args.node_address).set(0)
-    METRIC_SLASH_POINTS.labels(args.node_address).set(math.nan)
-    METRIC_SLASH_POINTS_PRESENT.labels(args.node_address).set(0)
+    # Ensure base series exist immediately for every configured node
+    for na in node_addresses:
+        METRIC_UP.labels(na).set(0)
+        METRIC_SLASH_POINTS.labels(na).set(math.nan)
+        METRIC_SLASH_POINTS_PRESENT.labels(na).set(0)
 
-    previous_node_chains: Set[str] = set()
+    previous_node_chains: Dict[str, Set[str]] = {na: set() for na in node_addresses}
     previous_global_chains: Set[str] = set()
+
+    # Track last status/preflight status per node so we can remove stale label series
+    previous_status: Dict[str, str] = {na: "" for na in node_addresses}
+    previous_preflight_status: Dict[str, str] = {na: "" for na in node_addresses}
 
     while not shutdown.stop:
         cycle_t0 = time.time()
-        LOG.debug("Scrape cycle start", extra={"node_address": args.node_address})
+        LOG.debug("Scrape cycle start", extra={"nodes": node_addresses})
 
+        cycle_ok = True
+
+        # 1) Per-node scrape
+        for configured_node in node_addresses:
+            node_cycle_t0 = time.time()
+            try:
+                node_payload = scrape_node(
+                    thornode_url=args.thornode_url,
+                    node_address=configured_node,
+                    timeout=args.timeout,
+                    insecure=args.insecure,
+                )
+
+                # Parse node fields requested
+                node_addr_field = _safe_str(node_payload.get("node_address"))
+                node_label = node_addr_field or configured_node
+
+                status = _safe_str(node_payload.get("status"))
+                node_operator_addr = _safe_str(node_payload.get("node_operator_address"))
+                total_bond = _parse_int(node_payload.get("total_bond"))
+                ip_address = _safe_str(node_payload.get("ip_address"))
+                version = _safe_str(node_payload.get("version"))
+                current_award = _parse_int(node_payload.get("current_award"))
+                missing_blocks = _parse_int(node_payload.get("missing_blocks"))
+
+                preflight_status, preflight_reason = parse_preflight(node_payload)
+
+                slash_points, slash_present = parse_slash_points_tolerant(node_payload)
+                observe_heights = parse_observe_chains(node_payload)
+                bp_total, bp_nonzero = parse_bond_providers_counts(node_payload)
+
+                # Export INFO / string metrics
+                METRIC_VALIDATOR_INFO.labels(
+                    node_address=node_label,
+                    status=status,
+                    node_operator_address=node_operator_addr,
+                    ip_address=ip_address,
+                    version=version,
+                ).set(1)
+
+                # Status series: set current, remove previous status label series (avoid accumulation)
+                prev_s = previous_status.get(node_label, "")
+                if prev_s and prev_s != status:
+                    try:
+                        METRIC_VALIDATOR_STATUS.remove(node_label, prev_s)
+                    except KeyError:
+                        pass
+                METRIC_VALIDATOR_STATUS.labels(node_label, status).set(1)
+                previous_status[node_label] = status
+
+                # Preflight series: set current, remove previous (avoid accumulation)
+                prev_ps = previous_preflight_status.get(node_label, "")
+                if prev_ps and prev_ps != preflight_status:
+                    try:
+                        METRIC_PREFLIGHT_STATUS.remove(node_label, prev_ps)
+                    except KeyError:
+                        pass
+                METRIC_PREFLIGHT_INFO.labels(node_label, preflight_status, preflight_reason).set(1)
+                METRIC_PREFLIGHT_STATUS.labels(node_label, preflight_status).set(1)
+                previous_preflight_status[node_label] = preflight_status
+
+                # Export numeric node metrics
+                if total_bond is not None:
+                    METRIC_TOTAL_BOND.labels(node_label).set(total_bond)
+                if current_award is not None:
+                    METRIC_CURRENT_AWARD.labels(node_label).set(current_award)
+                if missing_blocks is not None:
+                    METRIC_MISSING_BLOCKS.labels(node_label).set(missing_blocks)
+
+                METRIC_BOND_PROVIDERS_TOTAL.labels(node_label).set(bp_total)
+                METRIC_BOND_PROVIDERS_NONZERO.labels(node_label).set(bp_nonzero)
+
+                if slash_present and slash_points is not None:
+                    METRIC_SLASH_POINTS.labels(node_label).set(slash_points)
+                    METRIC_SLASH_POINTS_PRESENT.labels(node_label).set(1)
+                else:
+                    METRIC_SLASH_POINTS.labels(node_label).set(math.nan)
+                    METRIC_SLASH_POINTS_PRESENT.labels(node_label).set(0)
+                    LOG.warning(
+                        "slash_points not found in node payload; exporting NaN",
+                        extra={"node_address": configured_node, "node_label": node_label},
+                    )
+
+                # Export observe heights + stale cleanup per node_label
+                current_node_chains = set(observe_heights.keys())
+                prev_chains = previous_node_chains.get(node_label, set())
+                remove_stale_node_chain_metrics(node_label, prev_chains, current_node_chains)
+                previous_node_chains[node_label] = current_node_chains
+                for chain, observed in observe_heights.items():
+                    METRIC_OBSERVE_CHAIN_HEIGHT.labels(node_label, chain).set(observed)
+
+                node_duration = time.time() - node_cycle_t0
+                METRIC_SCRAPE_DURATION.labels(node_label).set(node_duration)
+                METRIC_UP.labels(node_label).set(1)
+                METRIC_LAST_SUCCESS_TS.labels(node_label).set(time.time())
+
+                LOG.info(
+                    "Node scrape succeeded",
+                    extra={
+                        "configured_node": configured_node,
+                        "node_label": node_label,
+                        "duration_s": round(node_duration, 4),
+                        "status": status,
+                        "node_operator_address": node_operator_addr,
+                        "ip_address": ip_address,
+                        "version": version,
+                        "total_bond": total_bond,
+                        "bond_providers_total": bp_total,
+                        "bond_providers_nonzero": bp_nonzero,
+                        "current_award": current_award,
+                        "preflight_status": preflight_status,
+                        "preflight_reason": preflight_reason,
+                        "missing_blocks": missing_blocks,
+                        "observe_chains": len(observe_heights),
+                    },
+                )
+
+                LOG.trace("Observe heights sample", extra={"node_label": node_label, "sample": dict(list(observe_heights.items())[:6])})
+
+            except Exception as e:
+                cycle_ok = False
+                node_duration = time.time() - node_cycle_t0
+                METRIC_SCRAPE_DURATION.labels(configured_node).set(node_duration)
+                METRIC_UP.labels(configured_node).set(0)
+                LOG.error(
+                    "Node scrape failed",
+                    extra={"configured_node": configured_node, "duration_s": round(node_duration, 4), "error": str(e)},
+                    exc_info=True,
+                )
+
+        # 2) Global lastblock scrape (once per cycle)
         try:
-            node_payload = scrape_node(
+            global_heights, lastblock_dt = scrape_global_lastblock_once(
                 thornode_url=args.thornode_url,
-                node_address=args.node_address,
                 timeout=args.timeout,
                 insecure=args.insecure,
             )
 
-            # Parse node fields requested
-            node_addr = _safe_str(node_payload.get("node_address"))
-            status = _safe_str(node_payload.get("status"))
-            node_operator_addr = _safe_str(node_payload.get("node_operator_address"))
-            total_bond = _parse_int(node_payload.get("total_bond"))
-            ip_address = _safe_str(node_payload.get("ip_address"))
-            version = _safe_str(node_payload.get("version"))
-            current_award = _parse_int(node_payload.get("current_award"))
-            missing_blocks = _parse_int(node_payload.get("missing_blocks"))
+            # Record the lastblock endpoint duration for each node (same request, same dt)
+            for na in node_addresses:
+                METRIC_ENDPOINT_DURATION.labels(na, "lastblock").set(lastblock_dt)
 
-            preflight_status, preflight_reason = parse_preflight(node_payload)
-
-            slash_points, slash_present = parse_slash_points_tolerant(node_payload)
-            observe_heights = parse_observe_chains(node_payload)
-            bp_total, bp_nonzero = parse_bond_providers_counts(node_payload)
-
-            # Export INFO / string metrics
-            METRIC_VALIDATOR_INFO.labels(
-                node_address=node_addr or args.node_address,
-                status=status,
-                node_operator_address=node_operator_addr,
-                ip_address=ip_address,
-                version=version,
-            ).set(1)
-
-            # The "current" status time-series; remove old label values so it doesn't accumulate.
-            # (Prometheus client does not support partial label deletion per-series easily without tracking;
-            # we keep it simple by only setting the current status series.)
-            METRIC_VALIDATOR_STATUS.labels(node_addr or args.node_address, status).set(1)
-
-            METRIC_PREFLIGHT_INFO.labels(
-                node_addr or args.node_address,
-                preflight_status,
-                preflight_reason,
-            ).set(1)
-            METRIC_PREFLIGHT_STATUS.labels(node_addr or args.node_address, preflight_status).set(1)
-
-            # Export numeric node metrics
-            if total_bond is not None:
-                METRIC_TOTAL_BOND.labels(node_addr or args.node_address).set(total_bond)
-            if current_award is not None:
-                METRIC_CURRENT_AWARD.labels(node_addr or args.node_address).set(current_award)
-            if missing_blocks is not None:
-                METRIC_MISSING_BLOCKS.labels(node_addr or args.node_address).set(missing_blocks)
-
-            METRIC_BOND_PROVIDERS_TOTAL.labels(node_addr or args.node_address).set(bp_total)
-            METRIC_BOND_PROVIDERS_NONZERO.labels(node_addr or args.node_address).set(bp_nonzero)
-
-            if slash_present and slash_points is not None:
-                METRIC_SLASH_POINTS.labels(node_addr or args.node_address).set(slash_points)
-                METRIC_SLASH_POINTS_PRESENT.labels(node_addr or args.node_address).set(1)
-            else:
-                METRIC_SLASH_POINTS.labels(node_addr or args.node_address).set(math.nan)
-                METRIC_SLASH_POINTS_PRESENT.labels(node_addr or args.node_address).set(0)
-                LOG.warning("slash_points not found in node payload; exporting NaN", extra={"node_address": args.node_address})
-
-            # Export observe heights + stale cleanup
-            current_node_chains = set(observe_heights.keys())
-            remove_stale_node_chain_metrics(node_addr or args.node_address, previous_node_chains, current_node_chains)
-            previous_node_chains = current_node_chains
-            for chain, observed in observe_heights.items():
-                METRIC_OBSERVE_CHAIN_HEIGHT.labels(node_addr or args.node_address, chain).set(observed)
-
-            # Global heights
-            global_heights = scrape_global_lastblock(
-                thornode_url=args.thornode_url,
-                node_address=args.node_address,
-                timeout=args.timeout,
-                insecure=args.insecure,
-            )
             current_global = set(global_heights.keys())
             remove_stale_global_chain_metrics(previous_global_chains, current_global)
             previous_global_chains = current_global
             for chain, height in global_heights.items():
                 METRIC_GLOBAL_LAST_OBS_IN.labels(chain).set(height)
 
-            duration = time.time() - cycle_t0
-            METRIC_SCRAPE_DURATION.labels(args.node_address).set(duration)
-            METRIC_UP.labels(args.node_address).set(1)
-            METRIC_LAST_SUCCESS_TS.labels(args.node_address).set(time.time())
-
-            LOG.info(
-                "Scrape cycle succeeded",
-                extra={
-                    "duration_s": round(duration, 4),
-                    "node_address_field": node_addr,
-                    "status": status,
-                    "node_operator_address": node_operator_addr,
-                    "ip_address": ip_address,
-                    "version": version,
-                    "total_bond": total_bond,
-                    "bond_providers_total": bp_total,
-                    "bond_providers_nonzero": bp_nonzero,
-                    "current_award": current_award,
-                    "preflight_status": preflight_status,
-                    "preflight_reason": preflight_reason,
-                    "missing_blocks": missing_blocks,
-                    "observe_chains": len(observe_heights),
-                    "global_chains": len(global_heights),
-                },
-            )
-
-            LOG.trace("Observe heights sample", extra={"sample": dict(list(observe_heights.items())[:6])})
+            LOG.debug("Global lastblock succeeded", extra={"duration_s": round(lastblock_dt, 4), "global_chains": len(global_heights)})
 
         except Exception as e:
-            duration = time.time() - cycle_t0
-            METRIC_SCRAPE_DURATION.labels(args.node_address).set(duration)
-            METRIC_UP.labels(args.node_address).set(0)
-            LOG.error("Scrape cycle failed", extra={"duration_s": round(duration, 4), "error": str(e)}, exc_info=True)
+            cycle_ok = False
+            LOG.error("Global lastblock scrape failed", extra={"error": str(e)}, exc_info=True)
+
+        cycle_duration = time.time() - cycle_t0
+        LOG.info("Scrape cycle complete", extra={"duration_s": round(cycle_duration, 4), "ok": cycle_ok})
 
         # Sleep in small increments
         sleep_left = args.interval
@@ -649,7 +726,7 @@ def main() -> None:
             time.sleep(step)
             sleep_left -= step
 
-    LOG.info("Exporter stopped", extra={"node_address": args.node_address})
+    LOG.info("Exporter stopped", extra={"node_addresses": node_addresses})
 
 
 if __name__ == "__main__":

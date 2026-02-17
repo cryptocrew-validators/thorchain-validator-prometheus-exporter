@@ -1,6 +1,10 @@
 # THORChain Validator Prometheus Exporter
 
-A Prometheus exporter for monitoring THORChain validator nodes. This exporter scrapes the THORChain API to collect validator metrics including status, slash points, observed chain heights, bond information, and more.
+A Prometheus exporter for monitoring **one or more THORChain validator nodes**.
+
+This exporter scrapes the THORChain API to collect validator metrics including status, slash points, observed chain heights, bond information, and more, and exposes them in **Prometheus text format**.
+
+---
 
 ## Features
 
@@ -9,10 +13,31 @@ A Prometheus exporter for monitoring THORChain validator nodes. This exporter sc
 - **Bond Providers**: Monitor bond provider counts and distribution
 - **Preflight Status**: Track validator preflight readiness
 
+---
+
+## Architecture Overview
+
+This project is a **Prometheus exporter**, not Prometheus itself.
+
+```
+THORNode API
+     ↓
+Exporter (this repo)  →  :9809 /metrics  (text)
+     ↓
+Prometheus            →  :9090 API       (JSON)
+     ↓
+Grafana / Alerts
+```
+
+---
+
 ## Requirements
 
 - Python 3.7+
-- `prometheus-client` library
+- `prometheus-client`
+- (Recommended) Prometheus
+
+---
 
 ## Installation
 
@@ -27,9 +52,11 @@ cd thorchain-validator-prometheus-exporter
 pip install -r requirements.txt
 ```
 
+---
+
 ## Usage
 
-### Basic Example
+### Single Node 
 
 ```bash
 python3 exporter.py \
@@ -37,82 +64,136 @@ python3 exporter.py \
   --node-address <YOUR_NODE_ADDRESS>
 ```
 
-### All Options
+### Multiple Nodes
 
 ```bash
 python3 exporter.py \
   --thornode-url https://thornode.ninerealms.com \
-  --node-address <YOUR_NODE_ADDRESS> \
-  --listen 0.0.0.0 \
-  --port 9809 \
-  --interval 15.0 \
-  --timeout 10.0 \
-  --log-level INFO \
-  --json-logs
+  --node-addresses thor1...,thor1...,thor1...
 ```
 
-### Command Line Arguments
+---
 
-| Argument | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `--thornode-url` | Yes | - | THORNode API base URL (e.g., `https://thornode.ninerealms.com`) |
-| `--node-address` | Yes | - | THORChain node address to monitor |
-| `--listen` | No | `0.0.0.0` | IP address to listen on |
-| `--port` | No | `9809` | Port to expose metrics on |
-| `--interval` | No | `15.0` | Scrape interval in seconds |
-| `--timeout` | No | `10.0` | HTTP request timeout in seconds |
-| `--log-level` | No | `INFO` | Log level: TRACE, DEBUG, INFO, WARNING, ERROR |
-| `--json-logs` | No | `false` | Output logs in JSON format |
-| `--insecure` | No | `false` | Disable TLS verification |
+## Command Line Arguments
+
+> ⚠️ **Important**  
+> Exactly **one** of `--node-address` or `--node-addresses` **must be provided**.
+
+| Argument | Required | Default | Description                                |
+|--------|----------|---------|--------------------------------------------|
+| `--thornode-url` | Yes | – | THORNode API base URL                      |
+| `--node-address` | XOR | – | **Single node address**                    |
+| `--node-addresses` | XOR | – | **Comma-separated list of node addresses** |
+| `--listen` | No | `0.0.0.0` | IP address to listen on                    |
+| `--port` | No | `9809` | Port to expose metrics                     |
+| `--interval` | No | `15.0` | Scrape interval in seconds                 |
+| `--timeout` | No | `10.0` | HTTP request timeout in seconds            |
+| `--log-level` | No | `INFO` | Log level: TRACE, DEBUG, INFO, WARNING, ERROR        |
+| `--json-logs` | No | `false` | Output logs in JSON                        |
+| `--insecure` | No | `false` | Disable TLS verification                   |
+
+## Public/ Free use thornode APIs
+- **Ninerealms**: https://thornode.ninerealms.com
+- **Liquify**: https://gateway.liquify.com/chain/thorchain_api
+
+---
+
+## Docker + Prometheus
+
+### docker-compose.yml
+
+```yaml
+services:
+  thorchain-exporter:
+    build: .
+    ports:
+      - "9809:9809"
+    command:
+      - --thornode-url=https://thornode.ninerealms.com
+      - --node-addresses=thor1...,thor1...
+      - --listen=0.0.0.0
+      - --port=9809
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    restart: unless-stopped
+```
+
+### prometheus.yml
+
+```yaml
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: thorchain_exporter
+    static_configs:
+      - targets:
+          - thorchain-exporter:9809
+```
+
+---
 
 ## Exported Metrics
 
 ### Validator Information
 
 | Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `thorchain_validator_info` | Gauge | `node_address`, `status`, `node_operator_address`, `ip_address`, `version` | Validator identity and status information (value always 1) |
-| `thorchain_validator_status` | Gauge | `node_address`, `status` | Current validator status (value always 1) |
-| `thorchain_validator_total_bond` | Gauge | `node_address` | Total bond amount in base units |
-| `thorchain_validator_current_award` | Gauge | `node_address` | Current award in base units |
-| `thorchain_validator_missing_blocks` | Gauge | `node_address` | Number of missing blocks |
+|------|------|--------|-------------|
+| `thorchain_validator_info` | Gauge | `node_address`, `status`, `node_operator_address`, `ip_address`, `version` | Validator identity and status |
+| `thorchain_validator_status` | Gauge | `node_address`, `status` | Current validator status |
+
+### Bond & Awards
+
+| Metric | Type | Labels | Description |
+|------|------|--------|-------------|
+| `thorchain_validator_total_bond` | Gauge | `node_address` | Total bond (base units) |
+| `thorchain_validator_current_award` | Gauge | `node_address` | Current award (base units) |
+| `thorchain_validator_missing_blocks` | Gauge | `node_address` | Missing blocks |
 
 ### Bond Providers
 
 | Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `thorchain_validator_bond_providers_total` | Gauge | `node_address` | Total count of bond providers |
-| `thorchain_validator_bond_providers_nonzero` | Gauge | `node_address` | Count of bond providers with bond > 0 |
+|------|------|--------|-------------|
+| `thorchain_validator_bond_providers_total` | Gauge | `node_address` | Total bond providers |
+| `thorchain_validator_bond_providers_nonzero` | Gauge | `node_address` | Providers with bond > 0 |
 
 ### Slash Points
 
 | Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `thorchain_validator_slash_points` | Gauge | `node_address` | Validator slash points (NaN if unavailable) |
-| `thorchain_validator_slash_points_present` | Gauge | `node_address` | 1 if slash_points field was found, 0 otherwise |
+|------|------|--------|-------------|
+| `thorchain_validator_slash_points` | Gauge | `node_address` | Slash points (NaN if unavailable) |
+| `thorchain_validator_slash_points_present` | Gauge | `node_address` | 1 if slash points present |
 
 ### Preflight Status
 
 | Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `thorchain_validator_preflight_status_info` | Gauge | `node_address`, `status`, `reason` | Preflight status with reason (value always 1) |
-| `thorchain_validator_preflight_status` | Gauge | `node_address`, `status` | Preflight status (value always 1) |
+|------|------|--------|-------------|
+| `thorchain_validator_preflight_status_info` | Gauge | `node_address`, `status`, `reason` | Preflight status with reason |
+| `thorchain_validator_preflight_status` | Gauge | `node_address`, `status` | Preflight readiness |
 
 ### Chain Heights
 
 | Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `thorchain_validator_observe_chain_height` | Gauge | `node_address`, `chain` | Observed chain height per chain for this validator |
-| `thorchain_chain_last_observed_in_height` | Gauge | `chain` | Global reference height per chain from `/thorchain/lastblock` |
+|------|------|--------|-------------|
+| `thorchain_validator_observe_chain_height` | Gauge | `node_address`, `chain` | Observed chain height |
+| `thorchain_chain_last_observed_in_height` | Gauge | `chain` | Global reference height |
 
 ### Exporter Health
 
 | Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `thorchain_exporter_up` | Gauge | `node_address` | 1 if last scrape succeeded, 0 otherwise |
-| `thorchain_exporter_last_success_timestamp_seconds` | Gauge | `node_address` | Unix timestamp of last successful scrape |
-| `thorchain_exporter_scrape_duration_seconds` | Gauge | `node_address` | Duration of last scrape cycle in seconds |
-| `thorchain_exporter_endpoint_duration_seconds` | Gauge | `node_address`, `endpoint` | Duration per endpoint (`node` or `lastblock`) |
+|------|------|--------|-------------|
+| `thorchain_exporter_up` | Gauge | `node_address` | Exporter up/down |
+| `thorchain_exporter_last_success_timestamp_seconds` | Gauge | `node_address` | Last success timestamp |
+| `thorchain_exporter_scrape_duration_seconds` | Gauge | `node_address` | Scrape duration |
+| `thorchain_exporter_endpoint_duration_seconds` | Gauge | `node_address`, `endpoint` | Endpoint duration |
+
+---
 
 ## Contributing
 
@@ -134,5 +215,5 @@ For issues, questions, or contributions, please open an issue on GitHub.
 
 ## Acknowledgments
 
-- 9R team for providing the public API
+- 9R and Liquify team for providing the public API
 - Prometheus community for the excellent client library
