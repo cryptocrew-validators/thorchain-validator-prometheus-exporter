@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   thorchain-exporter:
     build: .
@@ -26,7 +24,6 @@ services:
 
   prometheus:
     image: prom/prometheus:v2.52.0
-    container_name: prometheus
     ports:
       - "9090:9090"
     volumes:
@@ -34,6 +31,5 @@ services:
     command:
       - --config.file=/etc/prometheus/prometheus.yml
     depends_on:
-      thorchain-exporter:
-        condition: service_healthy
+      - thorchain-exporter
     restart: unless-stopped
